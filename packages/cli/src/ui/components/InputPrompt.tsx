@@ -5,7 +5,14 @@
  */
 
 import type React from 'react';
-import { useCallback, useEffect, useState, useRef, useMemo } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useState,
+  useRef,
+  useMemo,
+  Fragment,
+} from 'react';
 import clipboardy from 'clipboardy';
 import { Box, Text, useStdout, type DOMElement } from 'ink';
 import { SuggestionsDisplay, MAX_WIDTH } from './SuggestionsDisplay.js';
@@ -16,6 +23,7 @@ import {
   ScrollableList,
   type ScrollableListRef,
 } from './shared/ScrollableList.js';
+import { ListeningIndicator } from './ListeningIndicator.js';
 import { HalfLinePaddedBox } from './shared/HalfLinePaddedBox.js';
 import {
   type TextBuffer,
@@ -49,6 +57,7 @@ import {
   debugLogger,
   type Config,
 } from '@google/gemini-cli-core';
+import { useVoiceMode } from '../hooks/useVoiceMode.js';
 import {
   parseInputForHighlighting,
   parseSegmentsFromTokens,
@@ -66,10 +75,9 @@ import {
 import { parseSlashCommand } from '../../utils/commands.js';
 import * as path from 'node:path';
 import { SCREEN_READER_USER_PREFIX } from '../textConstants.js';
-import { getSafeLowColorBackground } from '../themes/color-utils.js';
-import { isLowColorDepth } from '../utils/terminalUtils.js';
 import { useShellFocusState } from '../contexts/ShellFocusContext.js';
 import { useUIState } from '../contexts/UIStateContext.js';
+import { useInputState } from '../contexts/InputContext.js';
 import {
   appEvents,
   AppEvent,
@@ -84,6 +92,9 @@ import { useAlternateBuffer } from '../hooks/useAlternateBuffer.js';
 import { useIsHelpDismissKey } from '../utils/shortcutsHelp.js';
 import { useRepeatedKeyPress } from '../hooks/useRepeatedKeyPress.js';
 import { useKeyMatchers } from '../hooks/useKeyMatchers.js';
+import type { VimMode } from '../contexts/VimModeContext.js';
+
+const SCROLLBAR_GUTTER_WIDTH = 1;
 
 /**
  * Returns if the terminal can be trusted to handle paste events atomically
@@ -104,23 +115,20 @@ export type ScrollableItem =
   | { type: 'ghostLine'; ghostLine: string; index: number };
 
 export interface InputPromptProps {
-  buffer: TextBuffer;
   onSubmit: (value: string) => void;
-  userMessages: readonly string[];
   onClearScreen: () => void;
   config: Config;
   slashCommands: readonly SlashCommand[];
   commandContext: CommandContext;
   placeholder?: string;
   focus?: boolean;
-  inputWidth: number;
-  suggestionsWidth: number;
-  shellModeActive: boolean;
   setShellModeActive: (value: boolean) => void;
   approvalMode: ApprovalMode;
   onEscapePromptChange?: (showPrompt: boolean) => void;
   onSuggestionsVisibilityChange?: (visible: boolean) => void;
   vimHandleInput?: (key: Key) => boolean;
+  vimEnabled?: boolean;
+  vimMode?: VimMode;
   isEmbeddedShellFocused?: boolean;
   setQueueErrorMessage: (message: string | null) => void;
   streamingState: StreamingState;
@@ -128,7 +136,6 @@ export interface InputPromptProps {
   onQueueMessage?: (message: string) => void;
   suggestionsPosition?: 'above' | 'below';
   setBannerVisible: (visible: boolean) => void;
-  copyModeEnabled?: boolean;
 }
 
 // The input content, input container, and input suggestions list may have different widths
@@ -159,7 +166,6 @@ export function isLargePaste(text: string): boolean {
 }
 
 const DOUBLE_TAB_CLEAN_UI_TOGGLE_WINDOW_MS = 350;
-
 /**
  * Attempt to toggle expansion of a paste placeholder in the buffer.
  * Returns true if a toggle action was performed or hint was shown, false otherwise.
@@ -199,23 +205,20 @@ export function tryTogglePasteExpansion(buffer: TextBuffer): boolean {
 }
 
 export const InputPrompt: React.FC<InputPromptProps> = ({
-  buffer,
   onSubmit,
-  userMessages,
   onClearScreen,
   config,
   slashCommands,
   commandContext,
   placeholder = '  Type your message or @path/to/file',
   focus = true,
-  inputWidth,
-  suggestionsWidth,
-  shellModeActive,
   setShellModeActive,
   approvalMode,
   onEscapePromptChange,
   onSuggestionsVisibilityChange,
   vimHandleInput,
+  vimEnabled,
+  vimMode,
   isEmbeddedShellFocused,
   setQueueErrorMessage,
   streamingState,
@@ -223,8 +226,16 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   onQueueMessage,
   suggestionsPosition = 'below',
   setBannerVisible,
-  copyModeEnabled = false,
 }) => {
+  const inputState = useInputState();
+  const {
+    buffer,
+    userMessages,
+    shellModeActive,
+    copyModeEnabled,
+    inputWidth,
+    suggestionsWidth,
+  } = inputState;
   const isHelpDismissKey = useIsHelpDismissKey();
   const keyMatchers = useKeyMatchers();
   const { stdout } = useStdout();
@@ -235,6 +246,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
     setEmbeddedShellFocused,
     setShortcutsHelpVisible,
     toggleCleanUiDetailsVisible,
+    setVoiceModeEnabled,
   } = useUIActions();
   const {
     terminalWidth,
@@ -243,6 +255,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
     backgroundTasks,
     backgroundTaskHeight,
     shortcutsHelpVisible,
+    isVoiceModeEnabled,
   } = useUIState();
   const [suppressCompletion, setSuppressCompletion] = useState(false);
   const { handlePress: registerPlainTabPress, resetCount: resetPlainTabPress } =
@@ -260,6 +273,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
           resetEscapeState();
           if (buffer.text.length > 0) {
             buffer.setText('');
+            resetTurnBaseline();
             resetCompletionState();
           } else if (history.length > 0) {
             onSubmit('/rewind');
@@ -277,6 +291,16 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   const innerBoxRef = useRef<DOMElement>(null);
   const hasUserNavigatedSuggestions = useRef(false);
   const listRef = useRef<ScrollableListRef<ScrollableItem>>(null);
+
+  const { isRecording, handleVoiceInput, resetTurnBaseline } = useVoiceMode({
+    buffer,
+    config,
+    settings,
+    setQueueErrorMessage,
+    isVoiceModeEnabled,
+    setVoiceModeEnabled,
+    keyMatchers,
+  });
 
   const [reverseSearchActive, setReverseSearchActive] = useState(false);
   const [commandSearchActive, setCommandSearchActive] = useState(false);
@@ -344,6 +368,20 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
     isShellSuggestionsVisible,
   } = completion;
 
+  const effectivePlaceholder = useMemo(() => {
+    if (!isVoiceModeEnabled) return placeholder;
+    const voiceAction =
+      (settings.experimental.voice?.activationMode ?? 'push-to-talk') ===
+      'push-to-talk'
+        ? 'hold space to talk'
+        : 'space to talk';
+    return `  Type your message or ${voiceAction} (Esc to exit)`;
+  }, [
+    isVoiceModeEnabled,
+    placeholder,
+    settings.experimental.voice?.activationMode,
+  ]);
+
   const showCursor =
     focus && isShellFocused && !isEmbeddedShellFocused && !copyModeEnabled;
 
@@ -384,6 +422,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       // Clear the buffer *before* calling onSubmit to prevent potential re-submission
       // if onSubmit triggers a re-render while the buffer still holds the old value.
       buffer.setText('');
+      resetTurnBaseline();
       onSubmit(processedValue);
       resetCompletionState();
       resetReverseSearchCompletionState();
@@ -395,6 +434,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       shellModeActive,
       shellHistory,
       resetReverseSearchCompletionState,
+      resetTurnBaseline,
     ],
   );
 
@@ -434,7 +474,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
             slashCommands,
           );
           if (commandToExecute?.isSafeConcurrent) {
-            inputHistory.handleSubmit(trimmedMessage);
+            handleSubmitAndClear(trimmedMessage);
             return;
           }
         }
@@ -452,6 +492,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       streamingState,
       setQueueErrorMessage,
       slashCommands,
+      handleSubmitAndClear,
     ],
   );
 
@@ -643,6 +684,8 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
 
   const handleInput = useCallback(
     (key: Key) => {
+      if (handleVoiceInput(key)) return true;
+
       // Determine if this keypress is a history navigation command
       const isHistoryUp =
         !shellModeActive &&
@@ -821,7 +864,11 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       }
 
       if (shortcutsHelpVisible) {
-        if (key.sequence === '?' && key.insertable) {
+        if (
+          key.sequence === '?' &&
+          key.insertable &&
+          (!vimEnabled || vimMode === 'INSERT')
+        ) {
           setShortcutsHelpVisible(false);
           buffer.handleInput(key);
           return true;
@@ -841,7 +888,8 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         key.sequence === '?' &&
         key.insertable &&
         !shortcutsHelpVisible &&
-        buffer.text.length === 0
+        buffer.text.length === 0 &&
+        (!vimEnabled || vimMode === 'INSERT')
       ) {
         setShortcutsHelpVisible(true);
         return true;
@@ -869,9 +917,9 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       ) {
         setShellModeActive(!shellModeActive);
         buffer.setText(''); // Clear the '!' from input
+        resetTurnBaseline();
         return true;
       }
-
       if (keyMatchers[Command.ESCAPE](key)) {
         const cancelSearch = (
           setActive: (active: boolean) => void,
@@ -1266,6 +1314,15 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         return true;
       }
 
+      if (keyMatchers[Command.DEPRECATED_OPEN_EXTERNAL_EDITOR](key)) {
+        const cmdKey = formatCommand(Command.OPEN_EXTERNAL_EDITOR);
+        appEvents.emit(AppEvent.TransientMessage, {
+          message: `Use ${cmdKey} to open the external editor.`,
+          type: TransientMessageType.Hint,
+        });
+        return true;
+      }
+
       // Ctrl+V for clipboard paste
       if (keyMatchers[Command.PASTE_CLIPBOARD](key)) {
         // eslint-disable-next-line @typescript-eslint/no-floating-promises
@@ -1327,6 +1384,8 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       resetCompletionState,
       resetEscapeState,
       vimHandleInput,
+      vimEnabled,
+      vimMode,
       reverseSearchActive,
       textBeforeReverseSearch,
       cursorPosition,
@@ -1347,6 +1406,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       backgroundTaskHeight,
       streamingState,
       handleEscPress,
+      resetTurnBaseline,
       registerPlainTabPress,
       resetPlainTabPress,
       toggleCleanUiDetailsVisible,
@@ -1356,9 +1416,9 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
       keyMatchers,
       isHelpDismissKey,
       settings,
+      handleVoiceInput,
     ],
   );
-
   useKeypress(handleInput, {
     isActive: !isEmbeddedShellFocused && !copyModeEnabled,
     priority: true,
@@ -1630,21 +1690,6 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   );
 
   const useBackgroundColor = config.getUseBackgroundColor();
-  const isLowColor = isLowColorDepth();
-  const terminalBg = theme.background.primary || 'black';
-
-  // We should fallback to lines if the background color is disabled OR if it is
-  // enabled but we are in a low color depth terminal where we don't have a safe
-  // background color to use.
-  const useLineFallback = useMemo(() => {
-    if (!useBackgroundColor) {
-      return true;
-    }
-    if (isLowColor) {
-      return !getSafeLowColorBackground(terminalBg);
-    }
-    return false;
-  }, [useBackgroundColor, isLowColor, terminalBg]);
 
   const prevCursorRef = useRef(buffer.visualCursor);
   const prevTextRef = useRef(buffer.text);
@@ -1683,8 +1728,11 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
     }
   }, [buffer.visualCursor, buffer.text, focus]);
 
-  const listBackgroundColor =
-    useLineFallback || !useBackgroundColor ? undefined : theme.background.input;
+  const listBackgroundColor = !useBackgroundColor
+    ? undefined
+    : theme.background.input;
+
+  const useLineFallback = !!process.env['NO_COLOR'];
 
   useEffect(() => {
     if (onSuggestionsVisibilityChange) {
@@ -1747,7 +1795,7 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
   return (
     <>
       {suggestionsPosition === 'above' && suggestionsNode}
-      {useLineFallback ? (
+      {useLineFallback || !useBackgroundColor ? (
         <Box
           borderStyle="round"
           borderTop={true}
@@ -1766,17 +1814,13 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
         backgroundOpacity={1}
         useBackgroundColor={useBackgroundColor}
       >
-        <Box
-          flexGrow={1}
-          flexDirection="row"
-          paddingX={1}
-          borderColor={borderColor}
-          borderStyle={useLineFallback ? 'round' : undefined}
-          borderTop={false}
-          borderBottom={false}
-          borderLeft={!useBackgroundColor}
-          borderRight={!useBackgroundColor}
-        >
+        <Box flexGrow={1} flexDirection="row" paddingX={1}>
+          {isVoiceModeEnabled &&
+            (isRecording ? (
+              <ListeningIndicator color={theme.text.accent} />
+            ) : (
+              <Text color={theme.text.accent}>🎤 </Text>
+            ))}
           <Text
             color={statusColor ?? theme.text.accent}
             aria-label={statusText || undefined}
@@ -1801,50 +1845,75 @@ export const InputPrompt: React.FC<InputPromptProps> = ({
             )}{' '}
           </Text>
           <Box flexGrow={1} flexDirection="column" ref={innerBoxRef}>
-            {buffer.text.length === 0 && placeholder ? (
-              showCursor ? (
-                <Text
-                  terminalCursorFocus={showCursor}
-                  terminalCursorPosition={0}
-                >
-                  {chalk.inverse(placeholder.slice(0, 1))}
-                  <Text color={theme.text.secondary}>
-                    {placeholder.slice(1)}
+            {buffer.text.length === 0 ? (
+              effectivePlaceholder ? (
+                showCursor ? (
+                  <Text
+                    terminalCursorFocus={showCursor}
+                    terminalCursorPosition={0}
+                  >
+                    {chalk.inverse(effectivePlaceholder.slice(0, 1))}
+                    <Text color={theme.text.secondary}>
+                      {effectivePlaceholder.slice(1)}
+                    </Text>
                   </Text>
-                </Text>
-              ) : (
-                <Text color={theme.text.secondary}>{placeholder}</Text>
-              )
+                ) : (
+                  <Text color={theme.text.secondary}>
+                    {effectivePlaceholder}
+                  </Text>
+                )
+              ) : null
             ) : (
               <Box
                 flexDirection="column"
                 height={Math.min(buffer.viewportHeight, scrollableData.length)}
                 width="100%"
               >
-                <ScrollableList
-                  ref={listRef}
-                  hasFocus={focus}
-                  data={scrollableData}
-                  renderItem={renderItem}
-                  estimatedItemHeight={() => 1}
-                  keyExtractor={(item) =>
-                    item.type === 'visualLine'
-                      ? `line-${item.absoluteVisualIdx}`
-                      : `ghost-${item.index}`
-                  }
-                  width="100%"
-                  backgroundColor={listBackgroundColor}
-                  containerHeight={Math.min(
-                    buffer.viewportHeight,
-                    scrollableData.length,
-                  )}
-                />
+                {config.getUseTerminalBuffer() ? (
+                  <ScrollableList
+                    ref={listRef}
+                    hasFocus={focus}
+                    data={scrollableData}
+                    renderItem={renderItem}
+                    estimatedItemHeight={() => 1}
+                    fixedItemHeight={true}
+                    keyExtractor={(item) =>
+                      item.type === 'visualLine'
+                        ? `line-${item.absoluteVisualIdx}`
+                        : `ghost-${item.index}`
+                    }
+                    width={inputWidth + SCROLLBAR_GUTTER_WIDTH}
+                    backgroundColor={listBackgroundColor}
+                    containerHeight={Math.min(
+                      buffer.viewportHeight,
+                      scrollableData.length,
+                    )}
+                  />
+                ) : (
+                  scrollableData
+                    .slice(
+                      buffer.visualScrollRow,
+                      buffer.visualScrollRow + buffer.viewportHeight,
+                    )
+                    .map((item, index) => {
+                      const actualIndex = buffer.visualScrollRow + index;
+                      const key =
+                        item.type === 'visualLine'
+                          ? `line-${item.absoluteVisualIdx}`
+                          : `ghost-${item.index}`;
+                      return (
+                        <Fragment key={key}>
+                          {renderItem({ item, index: actualIndex })}
+                        </Fragment>
+                      );
+                    })
+                )}
               </Box>
             )}
           </Box>
         </Box>
       </HalfLinePaddedBox>
-      {useLineFallback ? (
+      {useLineFallback || !useBackgroundColor ? (
         <Box
           borderStyle="round"
           borderTop={false}

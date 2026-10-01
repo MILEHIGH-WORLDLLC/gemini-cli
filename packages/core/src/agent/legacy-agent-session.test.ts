@@ -17,6 +17,9 @@ import type {
   ToolCallRequestInfo,
 } from '../scheduler/types.js';
 import { CoreToolCallStatus } from '../scheduler/types.js';
+import type { GeminiClient } from '../core/client.js';
+import type { Scheduler } from '../scheduler/scheduler.js';
+import type { Config } from '../config/config.js';
 
 // ---------------------------------------------------------------------------
 // Mock helpers
@@ -24,7 +27,7 @@ import { CoreToolCallStatus } from '../scheduler/types.js';
 
 function createMockDeps(
   overrides?: Partial<LegacyAgentSessionDeps>,
-): LegacyAgentSessionDeps {
+): Required<LegacyAgentSessionDeps> {
   const mockClient = {
     sendMessageStream: vi.fn(),
     getChat: vi.fn().mockReturnValue({
@@ -40,18 +43,22 @@ function createMockDeps(
   const mockConfig = {
     getMaxSessionTurns: vi.fn().mockReturnValue(-1),
     getModel: vi.fn().mockReturnValue('gemini-2.5-pro'),
+    getGeminiClient: vi.fn().mockReturnValue(mockClient),
+    getMessageBus: vi.fn().mockImplementation(() => ({
+      subscribe: vi.fn(),
+      unsubscribe: vi.fn(),
+    })),
   };
 
   return {
-    client: mockClient as unknown as LegacyAgentSessionDeps['client'],
-
-    scheduler: mockScheduler as unknown as LegacyAgentSessionDeps['scheduler'],
-
-    config: mockConfig as unknown as LegacyAgentSessionDeps['config'],
+    client: mockClient as unknown as GeminiClient,
+    scheduler: mockScheduler as unknown as Scheduler,
+    config: mockConfig as unknown as Config,
     promptId: 'test-prompt',
     streamId: 'test-stream',
+    getPreferredEditor: vi.fn().mockReturnValue(undefined),
     ...overrides,
-  };
+  } as Required<LegacyAgentSessionDeps>;
 }
 
 async function* makeStream(
@@ -95,7 +102,10 @@ function makeCompletedToolCall(
     response: {
       callId,
       responseParts: [{ text: responseText }],
-      resultDisplay: undefined,
+      resultDisplay: responseText,
+      display: {
+        result: { type: 'text', text: responseText },
+      },
       error: undefined,
       errorType: undefined,
     },
@@ -129,7 +139,7 @@ async function collectEvents(
 // ---------------------------------------------------------------------------
 
 describe('LegacyAgentSession', () => {
-  let deps: LegacyAgentSessionDeps;
+  let deps: Required<LegacyAgentSessionDeps>;
 
   beforeEach(() => {
     deps = createMockDeps();
@@ -193,7 +203,6 @@ describe('LegacyAgentSession', () => {
         expect.any(AbortSignal),
         'test-prompt',
         undefined,
-        false,
         'raw input',
       );
 
@@ -420,6 +429,12 @@ describe('LegacyAgentSession', () => {
         (e): e is AgentEvent<'tool_response'> => e.type === 'tool_response',
       );
       expect(toolResp?.name).toBe('read_file');
+      expect(toolResp?.display).toEqual(
+        expect.objectContaining({
+          name: 'read_file',
+          result: { type: 'text', text: 'file contents' },
+        }),
+      );
       expect(toolResp?.content).toEqual([
         { type: 'text', text: 'file contents' },
       ]);
@@ -482,9 +497,10 @@ describe('LegacyAgentSession', () => {
       expect(toolResp?.content).toEqual([
         { type: 'text', text: 'Permission denied' },
       ]);
-      expect(toolResp?.displayContent).toEqual([
-        { type: 'text', text: 'Error display' },
-      ]);
+      expect(toolResp?.display?.result).toEqual({
+        type: 'text',
+        text: 'Error display',
+      });
     });
 
     it('stops on STOP_EXECUTION tool error', async () => {
@@ -639,7 +655,7 @@ describe('LegacyAgentSession', () => {
           e.type === 'error' && e._meta?.['code'] === 'AGENT_EXECUTION_BLOCKED',
       );
       expect(blocked?.fatal).toBe(false);
-      expect(blocked?.message).toBe('Agent execution blocked: Blocked by hook');
+      expect(blocked?.message).toBe('Blocked by hook');
 
       const messages = events.filter(
         (e): e is AgentEvent<'message'> =>
@@ -1314,6 +1330,7 @@ describe('LegacyAgentSession', () => {
       );
       expect(err?.message).toBe('Connection refused');
       expect(err?.fatal).toBe(true);
+      expect(err?._meta?.['stack']).toBeDefined();
 
       const streamEnd = events.find(
         (e): e is AgentEvent<'agent_end'> => e.type === 'agent_end',

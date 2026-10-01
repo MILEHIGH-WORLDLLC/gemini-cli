@@ -15,7 +15,7 @@ import {
 } from './sessionUtils.js';
 import {
   SESSION_FILE_PREFIX,
-  type Config,
+  type Storage,
   type MessageRecord,
   CoreToolCallStatus,
 } from '@google/gemini-cli-core';
@@ -25,20 +25,17 @@ import { randomUUID } from 'node:crypto';
 
 describe('SessionSelector', () => {
   let tmpDir: string;
-  let config: Config;
+  let storage: Storage;
 
   beforeEach(async () => {
     // Create a temporary directory for testing
     tmpDir = path.join(process.cwd(), '.tmp-test-sessions');
     await fs.mkdir(tmpDir, { recursive: true });
 
-    // Mock config
-    config = {
-      storage: {
-        getProjectTempDir: () => tmpDir,
-      },
-      getSessionId: () => 'current-session-id',
-    } as Partial<Config> as Config;
+    // Mock storage
+    storage = {
+      getProjectTempDir: () => tmpDir,
+    } as Partial<Storage> as Storage;
   });
 
   afterEach(async () => {
@@ -48,6 +45,47 @@ describe('SessionSelector', () => {
     } catch {
       // Ignore cleanup errors
     }
+  });
+
+  describe('sessionExists', () => {
+    it('should return true if a session file with the exact UUID exists', async () => {
+      const sessionId = randomUUID();
+      const chatsDir = path.join(tmpDir, 'chats');
+      await fs.mkdir(chatsDir, { recursive: true });
+      await fs.writeFile(
+        path.join(
+          chatsDir,
+          `session-20240101T000000-${sessionId.slice(0, 8)}.jsonl`,
+        ),
+        JSON.stringify({ sessionId }),
+      );
+
+      const selector = new SessionSelector(storage);
+      const exists = await selector.sessionExists(sessionId);
+      expect(exists).toBe(true);
+    });
+
+    it('should return false if no session file matches the UUID', async () => {
+      const sessionId = randomUUID();
+      const chatsDir = path.join(tmpDir, 'chats');
+      await fs.mkdir(chatsDir, { recursive: true });
+      await fs.writeFile(
+        path.join(chatsDir, `session-different-uuid-20240101.jsonl`),
+        '{}',
+      );
+
+      const selector = new SessionSelector(storage);
+      const exists = await selector.sessionExists(sessionId);
+      expect(exists).toBe(false);
+    });
+
+    it('should return false if the chats directory does not exist', async () => {
+      const sessionId = randomUUID();
+      // Notice we do NOT create chatsDir here.
+      const selector = new SessionSelector(storage);
+      const exists = await selector.sessionExists(sessionId);
+      expect(exists).toBe(false);
+    });
   });
 
   it('should resolve session by UUID', async () => {
@@ -104,7 +142,7 @@ describe('SessionSelector', () => {
       JSON.stringify(session2, null, 2),
     );
 
-    const sessionSelector = new SessionSelector(config);
+    const sessionSelector = new SessionSelector(storage);
 
     // Test resolving by UUID
     const result1 = await sessionSelector.resolveSession(sessionId1);
@@ -170,7 +208,7 @@ describe('SessionSelector', () => {
       JSON.stringify(session2, null, 2),
     );
 
-    const sessionSelector = new SessionSelector(config);
+    const sessionSelector = new SessionSelector(storage);
 
     // Test resolving by index (1-based)
     const result1 = await sessionSelector.resolveSession('1');
@@ -234,7 +272,7 @@ describe('SessionSelector', () => {
       JSON.stringify(session2, null, 2),
     );
 
-    const sessionSelector = new SessionSelector(config);
+    const sessionSelector = new SessionSelector(storage);
 
     // Test resolving latest
     const result = await sessionSelector.resolveSession('latest');
@@ -271,7 +309,7 @@ describe('SessionSelector', () => {
       JSON.stringify(session, null, 2),
     );
 
-    const sessionSelector = new SessionSelector(config);
+    const sessionSelector = new SessionSelector(storage);
 
     // Test resolving by UUID with leading/trailing spaces
     const result = await sessionSelector.resolveSession(`  ${sessionId}  `);
@@ -334,7 +372,7 @@ describe('SessionSelector', () => {
       JSON.stringify(sessionDuplicate, null, 2),
     );
 
-    const sessionSelector = new SessionSelector(config);
+    const sessionSelector = new SessionSelector(storage);
     const sessions = await sessionSelector.listSessions();
 
     expect(sessions.length).toBe(1);
@@ -373,7 +411,7 @@ describe('SessionSelector', () => {
       JSON.stringify(session1, null, 2),
     );
 
-    const sessionSelector = new SessionSelector(config);
+    const sessionSelector = new SessionSelector(storage);
 
     await expect(
       sessionSelector.resolveSession('invalid-uuid'),
@@ -389,14 +427,11 @@ describe('SessionSelector', () => {
     const chatsDir = path.join(tmpDir, 'chats');
     await fs.mkdir(chatsDir, { recursive: true });
 
-    const emptyConfig = {
-      storage: {
-        getProjectTempDir: () => tmpDir,
-      },
-      getSessionId: () => 'current-session-id',
-    } as Partial<Config> as Config;
+    const emptyStorage = {
+      getProjectTempDir: () => tmpDir,
+    } as Partial<Storage> as Storage;
 
-    const sessionSelector = new SessionSelector(emptyConfig);
+    const sessionSelector = new SessionSelector(emptyStorage);
 
     await expect(sessionSelector.resolveSession('latest')).rejects.toSatisfy(
       (error) => {
@@ -469,7 +504,7 @@ describe('SessionSelector', () => {
       JSON.stringify(sessionSystemOnly, null, 2),
     );
 
-    const sessionSelector = new SessionSelector(config);
+    const sessionSelector = new SessionSelector(storage);
     const sessions = await sessionSelector.listSessions();
 
     // Should only list the session with user message
@@ -508,7 +543,7 @@ describe('SessionSelector', () => {
       JSON.stringify(sessionGeminiOnly, null, 2),
     );
 
-    const sessionSelector = new SessionSelector(config);
+    const sessionSelector = new SessionSelector(storage);
     const sessions = await sessionSelector.listSessions();
 
     // Should list the session with gemini message
@@ -574,12 +609,126 @@ describe('SessionSelector', () => {
       JSON.stringify(subagentSession, null, 2),
     );
 
-    const sessionSelector = new SessionSelector(config);
+    const sessionSelector = new SessionSelector(storage);
     const sessions = await sessionSelector.listSessions();
 
     // Should only list the main session
     expect(sessions.length).toBe(1);
     expect(sessions[0].id).toBe(mainSessionId);
+  });
+
+  it('should list legacy session JSON without timestamps (regression #18593)', async () => {
+    const sessionId = randomUUID();
+
+    const chatsDir = path.join(tmpDir, 'chats');
+    await fs.mkdir(chatsDir, { recursive: true });
+
+    const session = {
+      sessionId,
+      projectHash: 'test-hash',
+      messages: [
+        {
+          type: 'user',
+          content: 'Legacy session message',
+          id: 'msg1',
+          timestamp: '2024-01-01T10:00:00.000Z',
+        },
+      ],
+    };
+
+    const filePath = path.join(
+      chatsDir,
+      `${SESSION_FILE_PREFIX}2024-01-01T10-00-${sessionId.slice(0, 8)}.json`,
+    );
+    await fs.writeFile(filePath, JSON.stringify(session, null, 2));
+    const fallbackTimestamp = new Date('2024-01-01T10:30:00.000Z');
+    await fs.utimes(filePath, fallbackTimestamp, fallbackTimestamp);
+
+    const sessionSelector = new SessionSelector(storage);
+    const sessions = await sessionSelector.listSessions();
+
+    expect(sessions.length).toBe(1);
+    expect(sessions[0].id).toBe(sessionId);
+    expect(sessions[0].startTime).toBe(fallbackTimestamp.toISOString());
+    expect(sessions[0].lastUpdated).toBe(fallbackTimestamp.toISOString());
+  });
+
+  it('should resolve legacy session JSON without timestamps by UUID (regression #18593)', async () => {
+    const sessionId = randomUUID();
+
+    const chatsDir = path.join(tmpDir, 'chats');
+    await fs.mkdir(chatsDir, { recursive: true });
+
+    const session = {
+      sessionId,
+      projectHash: 'test-hash',
+      messages: [
+        {
+          type: 'user',
+          content: 'Legacy session message',
+          id: 'msg1',
+          timestamp: '2024-01-01T10:00:00.000Z',
+        },
+      ],
+    };
+
+    const filePath = path.join(
+      chatsDir,
+      `${SESSION_FILE_PREFIX}2024-01-01T10-00-${sessionId.slice(0, 8)}.json`,
+    );
+    await fs.writeFile(filePath, JSON.stringify(session, null, 2));
+    const fallbackTimestamp = new Date('2024-01-01T10:30:00.000Z');
+    await fs.utimes(filePath, fallbackTimestamp, fallbackTimestamp);
+
+    const sessionSelector = new SessionSelector(storage);
+    const result = await sessionSelector.resolveSession(sessionId);
+
+    expect(result.sessionData.sessionId).toBe(sessionId);
+    expect(result.sessionData.startTime).toBe(fallbackTimestamp.toISOString());
+    expect(result.sessionData.lastUpdated).toBe(
+      fallbackTimestamp.toISOString(),
+    );
+  });
+
+  it('should throw INVALID_SESSION_IDENTIFIER for a UUID that does not exist on disk at all', async () => {
+    const existingSessionId = randomUUID();
+    const nonExistentId = randomUUID();
+
+    const chatsDir = path.join(tmpDir, 'chats');
+    await fs.mkdir(chatsDir, { recursive: true });
+
+    const session = {
+      sessionId: existingSessionId,
+      projectHash: 'test-hash',
+      startTime: '2024-01-01T10:00:00.000Z',
+      lastUpdated: '2024-01-01T10:30:00.000Z',
+      messages: [
+        {
+          type: 'user',
+          content: 'Hello',
+          id: 'msg1',
+          timestamp: '2024-01-01T10:00:00.000Z',
+        },
+      ],
+    };
+
+    await fs.writeFile(
+      path.join(
+        chatsDir,
+        `${SESSION_FILE_PREFIX}2024-01-01T10-00-${existingSessionId.slice(0, 8)}.json`,
+      ),
+      JSON.stringify(session, null, 2),
+    );
+
+    const sessionSelector = new SessionSelector(storage);
+
+    await expect(sessionSelector.findSession(nonExistentId)).rejects.toSatisfy(
+      (error) => {
+        expect(error).toBeInstanceOf(SessionError);
+        expect((error as SessionError).code).toBe('INVALID_SESSION_IDENTIFIER');
+        return true;
+      },
+    );
   });
 });
 
